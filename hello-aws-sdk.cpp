@@ -12,7 +12,7 @@
 #include <aws/sqs/model/ReceiveMessageRequest.h>
 #include <aws/sqs/model/DeleteMessageRequest.h>
 
-
+#include <atomic>
 #include <cassert>
 
 // https://github.com/markcallen/snssqs/blob/master/create.js
@@ -163,22 +163,27 @@ void setQueueAttr(Callback cb)
 
 //////////////////////////////////////////////////////////////////////////////
 
-void getMessages() 
+void getMessages(std::atomic_bool& stop, std::shared_ptr<std::promise<void>> stopped)
 {
     using namespace Aws::SQS;
-    sqs().ReceiveMessageAsync(Model::ReceiveMessageRequest().WithQueueUrl(queueUrl).WithMaxNumberOfMessages(10), 
-        [](const SQSClient*, 
+    sqs().ReceiveMessageAsync(Model::ReceiveMessageRequest().WithQueueUrl(queueUrl).WithMaxNumberOfMessages(10),
+        [&stop, stopped](const SQSClient*,
             const Model::ReceiveMessageRequest&, 
             const Model::ReceiveMessageOutcome& outcome, 
             const std::shared_ptr<const Aws::Client::AsyncCallerContext>&) 
         {
-            for (const auto& message : outcome.GetResult().GetMessages())
+            const auto& messages = outcome.GetResult().GetMessages();
+            if (messages.empty() && stop)
+            {
+                return;
+            }
+            for (const auto& message : messages)
             {
                 std::cout << "Message received: " << message.GetBody() << '\n';
                 // TODO handle
                 sqs().DeleteMessageAsync(
                     Model::DeleteMessageRequest().WithQueueUrl(queueUrl).WithReceiptHandle(message.GetReceiptHandle()),
-                    [](const SQSClient*, 
+                    [stopped](const SQSClient*,
                         const Model::DeleteMessageRequest&, 
                         const Model::DeleteMessageOutcome& outcome, 
                         const std::shared_ptr<const Aws::Client::AsyncCallerContext>&) 
@@ -187,7 +192,7 @@ void getMessages()
                         // TODO handle
                     });
             }
-            getMessages();
+            getMessages(stop, stopped);
         });
 }
 
@@ -219,13 +224,20 @@ int main()
         Aws::SDKOptions options;
         Aws::InitAPI(options);
 
-        auto created = std::make_shared<std::promise<void>>();
-        auto fut = created->get_future();
-        series(createTopic, createQueue, getQueueAttr, snsSubscribe, setQueueAttr, [created] { created->set_value(); })();
-        created.reset();
-        fut.get();
+        {
+            auto created = std::make_shared<std::promise<void>>();
+            auto fut = created->get_future();
+            series(createTopic, createQueue, getQueueAttr, snsSubscribe, setQueueAttr, [created] { created->set_value(); })();
+            created.reset();
+            fut.get();
+        }
 
-        getMessages();
+        std::atomic_bool stop;
+        auto stopped = std::shared_ptr<std::promise<void>>(
+            new std::promise<void>, [](std::promise<void>* p) { p->set_value(); delete p; });
+        auto fut = stopped->get_future();
+        getMessages(stop, stopped);
+        stopped.reset();
 
         for (int i = 1; i <= 100; ++i)
         {
@@ -233,6 +245,9 @@ int main()
             s << "message: " << i;
             publish(s.str().c_str()).get();
         }
+
+        stop = true;
+        fut.get();
 
         Aws::ShutdownAPI(options);
     }
